@@ -409,10 +409,12 @@ function cardFor(acc) {
 const INTERNAL = /same person|same ownership|mesma titularidade|entre contas|credit card payment|pagamento de fatura|pagto fatura|pag fatura|fatura cart|investment|aplicac|resgate|cofrinho|dinheiro (retirado|reservado)/;
 
 function toRec(t, accById) {
-  if (t.status === 'PENDING') return null;                    // espera a transação ser confirmada
+  // Conta corrente: espera confirmar. Cartão: as compras da fatura aberta vêm como pendentes, então entram já.
+  if (t.status === 'PENDING' && !t.isCard) return null;
   const acc = accById[t.accountId] || {}, type = t.dir === 'in' ? 'in' : 'out', kind = t.isCard ? 'fatura' : 'conta';
   const desc = ((t.merchant && t.desc.length < 4 ? t.merchant : t.desc) || t.merchant || '(sem descrição)') + (t.inst ? ` (${t.inst.n}/${t.inst.total})` : '');
   const mv = { id: 'p:' + t.id, date: t.date, type, amount: t.amount, desc, st: 'pend', kind, src: 'pluggy', pcat: t.category, acc: t.accountId };
+  if (t.status === 'PENDING') mv.pend = 1;
   if (t.isCard && type === 'out') mv.card = cardFor(acc);
   const n = norm(desc + ' ' + (t.category || '')), me = norm(S.myname || '');
   if ((t.isCard && type === 'in' && /pagamento|payment|pgto/.test(n)) || INTERNAL.test(n) || (me.length > 3 && norm(desc).includes(me) && /transfer|pix|ted/.test(n))) mv.st = 'ign';
@@ -428,23 +430,32 @@ async function sync(opts = {}) {
   syncing = true; setBusy(true);
   const p = PW();
   try {
-    const from = p.lastSync && !opts.full ? addD(p.lastSync.slice(0, 10), -15) : addD(hoje(), -90);
+    // versão 2: passou a aceitar compras pendentes do cartão, então busca os 90 dias de novo uma vez
+    const full = opts.full || p.ver !== 2;
+    const from = p.lastSync && !full ? addD(p.lastSync.slice(0, 10), -15) : addD(hoje(), -90);
     const r = await api('/sync?from=' + from);
     p.items = r.items || []; p.accounts = r.accounts || []; p.bills = r.bills || [];
     const accById = Object.fromEntries(p.accounts.map(a => [a.id, a]));
+    // quantas movimentações chegaram de cada conta (aparece no cartão de configuração)
+    p.counts = {};
+    (r.transactions || []).forEach(t => { const c = p.counts[t.accountId] = p.counts[t.accountId] || { n: 0, pe: 0 }; c.n++; if (t.status === 'PENDING') c.pe++; });
+    // compra que veio pendente e agora chegou confirmada (com outro id): não lança de novo
+    const samePurchase = t => S.rec.find(x => x.pend && x.acc === t.accountId && !x.postedId && Math.abs(x.amount - t.amount) < .005 && Math.abs(new Date(x.date) - new Date(t.date)) <= 5 * 864e5);
     const have = new Set(S.rec.map(x => x.id));
     let novas = 0, auto = 0, rev = 0;
     (r.transactions || []).sort((a, b) => a.date.localeCompare(b.date)).forEach(t => {
-      if (have.has('p:' + t.id)) return;
+      if (have.has('p:' + t.id) || S.rec.some(x => x.postedId === t.id)) return;
+      if (t.isCard && t.status !== 'PENDING') { const old = samePurchase(t); if (old) { old.postedId = t.id; old.pend = 0; return; } }
       const mv = toRec(t, accById); if (!mv) return;
       S.rec.push(mv); have.add(mv.id); novas++;
       if (mv.st !== 'pend') return;
       const s = recSug(mv) || {}, cat = mv.cat || s.cat;
-      if (p.auto && !mv.dup && cat) { recCommit(mv, cat, s.pay || (mv.kind === 'fatura' ? 'Cartão' : recPay(mv))); auto++; } else rev++;
+      if (p.auto && !mv.dup && cat) { recCommit(mv, cat, mv.kind === 'fatura' ? 'Cartão' : (s.pay && s.pay !== 'Cartão' ? s.pay : recPay(mv))); auto++; } else rev++;
     });
     // limpa o histórico antigo de conciliação (mantém o banco do Firebase leve)
     const cut = addD(hoje(), -120);
     S.rec = S.rec.filter(x => !(x.src === 'pluggy' && x.st !== 'pend' && x.date < cut));
+    p.ver = 2;
     p.lastSync = new Date().toISOString(); p.lastErr = (r.errors || []).join(' · ') || null;
     save(); render(); renderRec(); renderPg();
     say(novas ? `${novas} movimentação(ões) nova(s): ${auto} lançada(s) sozinha(s), ${rev} para revisar.` : 'Tudo em dia. Nenhuma movimentação nova.');
@@ -517,13 +528,13 @@ function renderPg() {
   const items = p.items || [], accs = p.accounts || [];
   const badge = it => !it.ok ? '<span class="bd er">erro</span>' : /UPDATED|SUCCESS/.test(it.status + it.executionStatus) ? '<span class="bd ok">ok</span>' : /ERROR|OUTDATED|LOGIN/.test(it.status) ? '<span class="bd er">' + esc(it.status) + '</span>' : '<span class="bd wa">' + esc(it.status || '…') + '</span>';
   const when = s => s ? new Date(s).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
-  const cardOpts = sel => S.cards.map(c => `<option value="${c.id}"${c.id === sel ? ' selected' : ''}>${esc(c.name)}</option>`).join('');
+  const cardOpts = (sel, a) => `<option value=""${S.cards.some(c => c.id === sel) ? '' : ' selected'}>Vincular a um cartão do app…</option>` + S.cards.map(c => `<option value="${c.id}"${c.id === sel ? ' selected' : ''}>${esc(c.name)}</option>`).join('') + `<option value="__new">+ Criar cartão "${esc(a.name)}"</option>`;
   const list = items.length ? items.map(it => {
     const exp = it.consentExpiresAt ? diffD(hoje(), it.consentExpiresAt.slice(0, 10)) : null;
     return `<div class="it"><div class="rw"><b>${esc(it.bank || 'Banco')}${badge(it)}</b><button class="sm" data-pg="del" data-id="${esc(it.id)}" type="button">Remover</button></div>
       <small>Atualizado ${when(it.lastUpdatedAt)}${exp !== null ? ' · autorização ' + (exp < 0 ? 'expirou' : 'vale mais ' + exp + ' dia(s)') : ''}${it.error ? ' · ' + esc(it.error) : ''}</small>
-      ${accs.filter(a => a.itemId === it.id).map(a => `<div class="acc"><span>${a.type === 'CREDIT' ? '💳 ' : '🏦 '}${esc(a.name)}${a.credit && a.credit.dueDate ? ' <small>vence ' + dBR(a.credit.dueDate) + '</small>' : ''}</span><b>${fmt(+a.balance || 0)}</b></div>
-        ${a.type === 'CREDIT' ? `<select class="mp" data-acc="${esc(a.id)}" aria-label="Cartão do app para ${esc(a.name)}">${cardOpts(p.accMap[a.id])}</select>` : ''}`).join('')}</div>`;
+      ${accs.filter(a => a.itemId === it.id).map(a => `<div class="acc"><span>${a.type === 'CREDIT' ? '💳 ' : '🏦 '}${esc(a.name)}${a.credit && a.credit.dueDate ? ' <small>vence ' + dBR(a.credit.dueDate) + '</small>' : ''} <small>· ${(p.counts && p.counts[a.id] ? p.counts[a.id].n : 0)} mov.${p.counts && p.counts[a.id] && p.counts[a.id].pe ? ' (' + p.counts[a.id].pe + ' pendentes)' : ''}</small></span><b>${fmt(+a.balance || 0)}</b></div>
+        ${a.type === 'CREDIT' ? `<select class="mp" data-acc="${esc(a.id)}" aria-label="Cartão do app para ${esc(a.name)}">${cardOpts(p.accMap[a.id], a)}</select>` : ''}`).join('')}</div>`;
   }).join('') : '<p class="pgempty">Nenhum banco conectado ainda.</p>';
   el.innerHTML = `<h2>Contas bancárias automáticas</h2>
     <small style="display:block;margin-bottom:6px">Última sincronização: ${when(p.lastSync)}${p.lastErr ? ' · <span style="color:var(--out)">' + esc(p.lastErr) + '</span>' : ''}</small>
@@ -558,10 +569,293 @@ recSec.addEventListener('click', async e => {
 recSec.addEventListener('change', e => {
   if (e.target.id === 'pg-auto') { PW().auto = e.target.checked; save(); }
   else if (e.target.dataset.acc) {
-    const p = PW(), id = e.target.dataset.acc, card = isNaN(+e.target.value) ? e.target.value : +e.target.value;
-    p.accMap[id] = card; S.rec.forEach(x => { if (x.acc === id && x.st === 'pend' && x.type === 'out') x.card = card; }); save(); say('Cartão vinculado.');
+    const p = PW(), id = e.target.dataset.acc;
+    if (!e.target.value) return;
+    if (e.target.value === '__new') {
+      const acc = p.accounts.find(a => a.id === id) || { id, name: 'Cartão' };
+      const nm = String(acc.name || 'Cartão').replace(/\s+/g, ' ').trim().slice(0, 30);
+      let c = S.cards.find(x => norm(x.name) === norm(nm));
+      if (!c) { c = { id: typeof uid === 'function' ? uid() : Date.now(), name: nm }; S.cards.push(c); try { fillCards(); } catch (err) {} }
+      e.target.value = String(c.id);
+    }
+    const card = isNaN(+e.target.value) ? e.target.value : +e.target.value;
+    p.accMap[id] = card; S.rec.forEach(x => { if (x.acc === id && x.st === 'pend' && x.type === 'out') x.card = card; }); save(); render(); renderPg(); say('Cartão vinculado.');
   }
 });
+
+// ================================================================== EXTRAS
+// 1) Forma de pagamento "Débito"  2) Transferências entre contas  3) Planilha de contas fixas
+const XLSX_JS = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+document.head.insertAdjacentHTML('beforeend', `<style id="pgx-css">
+#trc .g2{margin-top:8px}#trc select,#trc input{margin-top:8px}
+#trl li{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:9px 0;border-top:1px solid var(--ln)}#trl li:first-child{border-top:0}
+#trl small{grid-column:1/-1}#trl button{border:0;background:none;color:var(--mu);text-decoration:underline;padding:0;min-height:0;font-size:.82rem;justify-self:start}
+.pgx-m .mbox{max-width:440px}.pgx-m select,.pgx-m input{margin-top:8px}
+#imp-tb{width:100%;border-collapse:collapse;font-size:.86rem;margin-top:8px}
+#imp-tb td,#imp-tb th{padding:6px 4px;border-top:1px solid var(--ln);text-align:left;vertical-align:middle}
+#imp-tb select{min-height:32px;padding:2px 6px;font-size:.82rem;width:100%}#imp-tb input[type=checkbox]{width:auto;min-height:0}
+#imp-tb .du{color:var(--am);font-size:.75rem;display:block}
+#impc .bk{margin-top:10px}
+.lsg [aria-selected=true]{color:#fff}
+</style>`);
+
+// ---------- 1) Débito ----------
+// "Cartão" no app quer dizer cartão de crédito (exige escolher o cartão). Compras no débito ganham opção própria.
+if (Array.isArray(window.PAYS || (typeof PAYS !== 'undefined' && PAYS)) && !PAYS.includes('Débito')) PAYS.splice(1, 0, 'Débito');
+(() => {
+  const etp = $('etp');
+  if (etp && ![...etp.options].some(o => o.value === 'Débito')) etp.options[0].insertAdjacentHTML('afterend', '<option>Débito</option>');
+  const pix = document.querySelector('input[name=pg][value=Pix]');
+  if (pix && !document.querySelector('input[name=pg][value="Débito"]')) {
+    pix.closest('label').insertAdjacentHTML('afterend', '<label><input type="radio" name="pg" value="Débito">Débito</label>');
+    const grp = pix.closest('.seg'); if (grp) grp.style.gridTemplateColumns = 'repeat(4,1fr)';
+    const r = document.querySelector('input[name=pg][value="Débito"]');
+    r.addEventListener('change', () => { try { parUI(); } catch (e) {} });
+  }
+})();
+window.recPay = function (mv) {
+  if (mv.kind === 'fatura') return 'Cartão';
+  const n = norm(mv.desc || '');
+  return /pix|transfer|\bted\b|\bdoc\b/.test(n) ? 'Pix' : /saque/.test(n) ? 'Dinheiro' : /debito|compra/.test(n) ? 'Débito' : 'Pix';
+};
+// Corrige o que já entrou como "Cartão" sem cartão (compras no débito)
+(() => {
+  let n = 0;
+  S.tx.forEach(t => { if (t.type === 'out' && t.pay === 'Cartão' && !t.card && /debito/.test(norm(t.desc || ''))) { t.pay = 'Débito'; n++; } });
+  S.rec.forEach(x => { if (x.st === 'pend' && x.kind !== 'fatura' && x.pay === 'Cartão') { x.pay = 'Débito'; n++; } });
+  if (n) { save(); setTimeout(() => { try { render(); renderRec(); } catch (e) {} }, 0); }
+})();
+
+// ---------- 2) Transferências ----------
+// Não contam como receita nem despesa: só registram o dinheiro mudando de lugar.
+const TRF = () => (Array.isArray(S.trf) ? S.trf : (S.trf = []));
+function contas() {
+  const p = P(), list = [];
+  const banks = p.accounts.filter(a => a.type === 'BANK');
+  banks.forEach(a => {
+    const dup = banks.filter(b => b.name === a.name).length > 1;
+    list.push({ id: 'pg:' + a.id, name: a.name + (dup && a.number ? ' ' + String(a.number).slice(-6) : '') });
+  });
+  (S.cards || []).forEach(c => list.push({ id: 'card:' + c.id, name: 'Fatura do cartão ' + c.name }));
+  list.push({ id: 'cash', name: 'Dinheiro (carteira)' });
+  (Array.isArray(S.contas) ? S.contas : []).forEach(c => list.push({ id: 'c:' + c.id, name: c.name }));
+  return list;
+}
+// conta do app correspondente a um pendente do Pluggy (banco → 'pg:', cartão → 'card:')
+function accRef(x) {
+  if (!x.acc) return '';
+  const a = P().accounts.find(y => y.id === x.acc);
+  if (a && a.type === 'CREDIT') { const c = P().accMap[x.acc] || x.card; return c ? 'card:' + c : ''; }
+  return 'pg:' + x.acc;
+}
+const contaName = id => (contas().find(c => c.id === id) || {}).name || '(conta removida)';
+const contaOpts = (sel, ph) => `<option value="">${ph}</option>` + contas().map(c => `<option value="${esc(c.id)}"${c.id === sel ? ' selected' : ''}>${esc(c.name)}</option>`).join('') + '<option value="__new">+ Outra conta…</option>';
+function newConta(sel) {
+  const n = (prompt('Nome da conta (ex.: Poupança Caixa, Carteira digital):') || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+  if (!n) { sel.value = ''; return; }
+  if (!Array.isArray(S.contas)) S.contas = [];
+  const c = { id: typeof uid === 'function' ? uid() : Date.now(), name: n }; S.contas.push(c); save();
+  document.querySelectorAll('select[data-conta]').forEach(s => { const v = s === sel ? 'c:' + c.id : s.value; s.innerHTML = contaOpts(v, s.dataset.conta); });
+}
+document.addEventListener('change', e => { const s = e.target.closest && e.target.closest('select[data-conta]'); if (s && s.value === '__new') newConta(s); });
+
+$('f').insertAdjacentHTML('afterend', `<div class="card" id="trc">
+  <h2>Transferência entre contas</h2>
+  <small style="display:block">Dinheiro que muda de lugar (de um banco para outro, pagamento da fatura, saque). Não entra como receita nem despesa.</small>
+  <select id="tr-de" data-conta="De qual conta saiu?" aria-label="Conta de origem"></select>
+  <select id="tr-pa" data-conta="Para qual conta foi?" aria-label="Conta de destino"></select>
+  <div class="g2"><input id="tr-v" inputmode="decimal" placeholder="Valor" aria-label="Valor"><input id="tr-d" type="date" aria-label="Data"></div>
+  <input id="tr-s" placeholder="Descrição (opcional)" aria-label="Descrição">
+  <p id="tr-e" role="alert" style="color:var(--out);font-size:.88rem;min-height:1.2em;margin:6px 0 0"></p>
+  <button class="go" id="tr-ok" type="button">Registrar transferência</button>
+  <ul id="trl" style="margin-top:12px"></ul></div>`);
+function renderTrf() {
+  if (!$('trc')) return;
+  ['tr-de', 'tr-pa'].forEach(id => { const s = $(id); s.innerHTML = contaOpts(s.value, s.dataset.conta); });
+  if (!$('tr-d').value) $('tr-d').value = hoje();
+  const l = TRF().filter(t => t.date && t.date.slice(0, 7) === m).sort((a, b) => b.date.localeCompare(a.date));
+  $('trl').innerHTML = l.length ? l.map(t => `<li><span>${esc(t.fromN || contaName(t.from))} → ${esc(t.toN || contaName(t.to))}</span><b>${fmt(t.v)}</b>
+    <small>${dBR(t.date)}${t.desc ? ' · ' + esc(t.desc) : ''}</small><button type="button" data-trdel="${esc(t.id)}">Excluir</button></li>`).join('')
+    : '<li class="pgempty" style="display:block">Nenhuma transferência neste mês.</li>';
+}
+function addTrf({ from, to, v, date, desc }) {
+  const t = { id: String(typeof uid === 'function' ? uid() : Date.now()), from, to, fromN: contaName(from), toN: contaName(to), v: Math.round(v * 100) / 100, date, desc: (desc || '').slice(0, 120) };
+  TRF().push(t); return t;
+}
+$('tr-ok').addEventListener('click', () => {
+  const from = $('tr-de').value, to = $('tr-pa').value, v = parse($('tr-v').value), d = $('tr-d').value, er = $('tr-e');
+  if (!from || !to || from === '__new' || to === '__new') return er.textContent = 'Escolha a conta de origem e a de destino.';
+  if (from === to) return er.textContent = 'A origem e o destino precisam ser diferentes.';
+  if (!(v > 0)) return er.textContent = 'Digite um valor maior que zero.';
+  if (!d) return er.textContent = 'Escolha a data.';
+  er.textContent = ''; addTrf({ from, to, v, date: d, desc: $('tr-s').value.trim() });
+  $('tr-v').value = ''; $('tr-s').value = ''; save(); renderTrf(); say('Transferência registrada.');
+});
+$('trl').addEventListener('click', e => {
+  const b = e.target.closest('[data-trdel]'); if (!b) return;
+  if (b.dataset.arm !== '1') { b.dataset.arm = '1'; b.textContent = 'Confirmar exclusão?'; setTimeout(() => { b.dataset.arm = ''; b.textContent = 'Excluir'; }, 3500); return; }
+  S.trf = TRF().filter(t => t.id !== b.dataset.trdel); save(); renderTrf();
+});
+
+// Janela para transformar um pendente ou um lançamento em transferência
+document.body.insertAdjacentHTML('beforeend', `<div class="mdl pgx-m" id="trm" hidden role="dialog" aria-modal="true" aria-labelledby="trm-t"><div class="mbox">
+  <h3 id="trm-t">É uma transferência entre contas</h3><p class="mi" id="trm-i"></p>
+  <select id="trm-de" data-conta="De qual conta saiu?" aria-label="Conta de origem"></select>
+  <select id="trm-pa" data-conta="Para qual conta foi?" aria-label="Conta de destino"></select>
+  <p id="trm-e" role="alert" style="color:var(--out);font-size:.88rem;min-height:1.2em;margin:6px 0"></p>
+  <button class="go" id="trm-ok" type="button">Salvar como transferência</button>
+  <div class="bk"><button id="trm-c" type="button">Cancelar</button></div></div></div>`);
+let trmCtx = null;
+function openTrm(ctx) {
+  trmCtx = ctx;
+  $('trm-i').textContent = `${fmt(ctx.v)} em ${dBR(ctx.date)} · ${ctx.desc || ''}. Ela deixa de contar como ${ctx.type === 'in' ? 'receita' : 'despesa'}.`;
+  $('trm-de').innerHTML = contaOpts(ctx.type === 'out' ? ctx.acc : '', $('trm-de').dataset.conta);
+  $('trm-pa').innerHTML = contaOpts(ctx.type === 'in' ? ctx.acc : '', $('trm-pa').dataset.conta);
+  $('trm-e').textContent = ''; $('trm').hidden = false;
+}
+$('trm-c').addEventListener('click', () => { $('trm').hidden = true; });
+$('trm-ok').addEventListener('click', () => {
+  const from = $('trm-de').value, to = $('trm-pa').value, c = trmCtx;
+  if (!from || !to || from === '__new' || to === '__new') return $('trm-e').textContent = 'Escolha a origem e o destino.';
+  if (from === to) return $('trm-e').textContent = 'A origem e o destino precisam ser diferentes.';
+  addTrf({ from, to, v: c.v, date: c.date, desc: c.desc });
+  c.done();
+  // o outro lado da transferência (a entrada no outro banco), se já chegou
+  const near = x => Math.abs(new Date(x.date) - new Date(c.date)) <= 3 * 864e5 && Math.abs(x.amount - c.v) < .005;
+  let extra = 0;
+  S.rec.forEach(x => { if (x.st === 'pend' && x.type !== c.type && near(x)) { x.st = 'done'; x.trf = 1; extra++; } });
+  const twin = S.tx.find(x => x.type !== c.type && near(x) && !x.cx && !x.sid);
+  if (twin && confirm(`Encontrei ${twin.type === 'in' ? 'uma entrada' : 'uma saída'} de ${fmt(twin.amount)} em ${dBR(twin.date)} ("${twin.desc}"), que parece ser o outro lado desta transferência.\n\nOK = tirar dos lançamentos também.`)) { S.tx = S.tx.filter(x => x !== twin); extra++; }
+  $('trm').hidden = true; save(); render(); renderRec(); renderTrf();
+  say('Salvo como transferência' + (extra ? ' (o outro lado também foi ajustado).' : '.'));
+});
+
+// Botão "Transferência" em cada pendente
+const _renderRec = window.renderRec;
+window.renderRec = function () {
+  const r = _renderRec.apply(this, arguments);
+  document.querySelectorAll('#rcl li[data-r]').forEach(li => {
+    const bk = li.querySelector('.bk'); if (bk && !bk.querySelector('[data-a=trf]')) bk.insertAdjacentHTML('beforeend', '<button data-a="trf" type="button">Transferência</button>');
+  });
+  return r;
+};
+$('rcl').addEventListener('click', e => {
+  const b = e.target.closest('[data-a=trf]'); if (!b) return;
+  e.stopImmediatePropagation(); e.preventDefault();
+  const x = S.rec.find(v => v.id === b.closest('li').dataset.r); if (!x) return;
+  openTrm({ v: x.amount, date: x.date, desc: x.desc, type: x.type, acc: accRef(x), done: () => { x.st = 'done'; x.trf = 1; } });
+}, true);
+// Botão no "Editar lançamento"
+$('etsv').insertAdjacentHTML('afterend', '<button class="sm" id="et-trf" type="button" style="width:100%;margin-top:8px">É transferência entre contas</button>');
+$('et-trf').addEventListener('click', () => {
+  const t = etT; if (!t) return;
+  if (t.sid || t.cx || t.res) { $('eter').textContent = 'Parcelas, caixinhas e ressarcimentos não podem virar transferência.'; return; }
+  $('etm').hidden = true;
+  openTrm({ v: t.amount, date: t.date, desc: t.desc, type: t.type, acc: '', done: () => { S.tx = S.tx.filter(x => x !== t); } });
+});
+renderTrf();
+
+// ---------- 3) Planilha de contas fixas ----------
+const IMP_HTML = `<div class="card" id="impc">
+  <h2>Importar planilha de contas fixas</h2>
+  <small style="display:block">Para o que não cai sozinho no banco nem no cartão (boleto, aluguel, condomínio, escola…). Cada linha vira um compromisso que se repete todo mês, entra na Previsão e gera aviso no celular antes do vencimento.</small>
+  <small style="display:block;margin-top:6px">Colunas reconhecidas: <b>Descrição</b>, <b>Valor</b>, <b>Dia</b> (ou data do vencimento), <b>Categoria</b> e, se quiser, <b>Repete</b> (sim/não).</small>
+  <div class="bk"><label for="imp-f" class="go" style="display:flex;align-items:center;justify-content:center;cursor:pointer">Escolher planilha</label><button id="imp-mod" type="button">Baixar modelo</button></div>
+  <input id="imp-f" type="file" accept=".xlsx,.xls,.csv,.ods,text/csv" class="sr" style="position:absolute;width:1px;height:1px;opacity:0">
+</div>`;
+const _renderCpv = window.renderCpv;
+window.renderCpv = function () { const r = _renderCpv.apply(this, arguments); if (!$('impc')) $('cpv').insertAdjacentHTML('beforeend', IMP_HTML); return r; };
+document.addEventListener('click', e => {
+  if (!e.target.closest('#imp-mod')) return;
+  const csv = '﻿Descrição;Valor;Dia do vencimento;Categoria;Repete todo mês\nAluguel;1500,00;10;Casa;sim\nCondomínio;450,00;5;Casa;sim\nInternet;119,90;15;Casa;sim\nEscola de inglês;350,00;20;Estudo;sim\nIPVA (cota única);850,00;20/01/2027;Transporte;não\n';
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); a.download = 'modelo-contas-fixas.csv'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+});
+document.addEventListener('change', async e => {
+  if (e.target.id !== 'imp-f') return;
+  const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+  try { const rows = await readSheet(f); openImp(parseFixas(rows)); }
+  catch (err) { say('Não consegui ler a planilha: ' + err.message, true); }
+});
+function loadXlsx() {
+  if (window.XLSX) return Promise.resolve();
+  return new Promise((ok, no) => { const s = document.createElement('script'); s.src = XLSX_JS; s.onload = ok; s.onerror = () => no(new Error('sem internet para abrir .xlsx; salve como CSV e tente de novo')); document.head.appendChild(s); });
+}
+async function readSheet(f) {
+  if (/\.csv$/i.test(f.name) || f.type === 'text/csv') return csvRows((await readTxt(f)).replace(/^﻿/, ''));
+  await loadXlsx();
+  const wb = XLSX.read(await f.arrayBuffer(), { type: 'array', cellDates: true });
+  return XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: true, defval: '' });
+}
+function parseFixas(rows) {
+  rows = rows.filter(r => r && r.some(c => String(c).trim()));
+  const hi = rows.findIndex(r => r.some(c => /descri|nome|conta|item|despesa|gasto|compromisso/.test(norm(c))) && r.some(c => /valor|preco|quantia|montante|r\$/.test(norm(c))));
+  if (hi < 0) throw new Error('não achei as colunas Descrição e Valor. Use o modelo.');
+  const H = rows[hi].map(c => norm(c)), ix = re => H.findIndex(h => re.test(h));
+  const cN = ix(/descri|nome|conta|item|despesa|gasto|compromisso/), cV = ix(/valor|preco|quantia|montante|r\$/), cD = ix(/dia|venc|data/),
+    cC = ix(/categ/), cR = ix(/repet|mensal|recorr|fixo|todo mes/);
+  const out = [], mes = hoje().slice(0, 7);
+  rows.slice(hi + 1).forEach(r => {
+    const n = String(r[cN] ?? '').replace(/\s+/g, ' ').trim().slice(0, 60); if (!n) return;
+    const rawV = r[cV]; const v = Math.round(Math.abs(typeof rawV === 'number' ? rawV : pnum(rawV)) * 100) / 100; if (!(v > 0)) return;
+    let day = 0, date = '';
+    const rd = cD >= 0 ? r[cD] : '';
+    if (rd instanceof Date && !isNaN(rd)) date = new Date(rd.getTime() - rd.getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
+    else if (typeof rd === 'number' && rd > 31) { const d = new Date(Math.round((rd - 25569) * 864e5)); date = d.toISOString().slice(0, 10); }
+    else if (/^\s*\d{1,2}\s*$/.test(String(rd))) day = Math.min(31, Math.max(1, parseInt(rd, 10)));
+    else if (String(rd).trim()) date = toISO(String(rd));
+    if (date) day = +date.slice(8, 10);
+    // sem a coluna "Repete", tudo é tratado como conta fixa mensal
+    const rep = cR >= 0 && String(r[cR]).trim() ? !/^(n|nao|no|0|false|unica)/.test(norm(r[cR])) : true;
+    const catTxt = cC >= 0 ? String(r[cC] || '').trim() : '';
+    let c = catTxt && CATS.out.find(x => norm(x) === norm(catTxt));
+    if (!c && catTxt) c = catTxt.slice(0, 30);                          // categoria nova da planilha
+    if (!c) c = mapCat(n, 'out') || (CATS.out.includes('Casa') ? 'Casa' : CATS.out.find(x => x !== 'Caixinhas') || 'Outros');
+    const dup = rep ? (S.cfix || []).some(x => !x.to && norm(x.n) === norm(n)) : (S.comp || []).some(x => norm(x.n) === norm(n) && x.d === date);
+    out.push({ n, v, day, date, rep: rep || !date, c, from: date ? date.slice(0, 7) : mes, dup, on: !dup });
+  });
+  if (!out.length) throw new Error('nenhuma linha com descrição e valor.');
+  return out;
+}
+document.body.insertAdjacentHTML('beforeend', `<div class="mdl pgx-m" id="impm" hidden role="dialog" aria-modal="true" aria-labelledby="impm-t"><div class="mbox" style="max-width:560px">
+  <h3 id="impm-t">Contas fixas da planilha</h3><p class="mi" id="impm-i"></p>
+  <div style="max-height:52vh;overflow:auto"><table id="imp-tb"></table></div>
+  <button class="go" id="impm-ok" type="button" style="margin-top:12px">Criar compromissos</button>
+  <div class="bk"><button id="impm-c" type="button">Cancelar</button></div></div></div>`);
+let IMP = [];
+function openImp(list) {
+  IMP = list;
+  const cats = [...new Set([...CATS.out.filter(c => c !== 'Caixinhas'), ...list.map(x => x.c)])];
+  $('impm-i').textContent = `${list.length} linha(s) encontrada(s). Confira a categoria e desmarque o que não quiser.${list.some(x => x.dup) ? ' As marcadas como "já existe" ficaram desmarcadas.' : ''}`;
+  $('imp-tb').innerHTML = '<tr><th></th><th>Conta</th><th>Valor</th><th>Venc.</th><th>Categoria</th></tr>' + list.map((x, i) => `<tr>
+    <td><input type="checkbox" data-i="${i}" ${x.on ? 'checked' : ''} aria-label="Importar ${esc(x.n)}"></td>
+    <td>${esc(x.n)}${x.dup ? '<span class="du">já existe</span>' : ''}</td><td>${fmt(x.v)}</td>
+    <td>${x.rep ? 'dia ' + (x.day || '—') + ' <small>todo mês</small>' : dBR(x.date) + '/' + x.date.slice(2, 4)}</td>
+    <td><select data-c="${i}" aria-label="Categoria de ${esc(x.n)}">${cats.map(c => `<option${c === x.c ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select></td></tr>`).join('');
+  $('impm').hidden = false;
+}
+$('imp-tb').addEventListener('change', e => {
+  if (e.target.dataset.i !== undefined) IMP[+e.target.dataset.i].on = e.target.checked;
+  if (e.target.dataset.c !== undefined) IMP[+e.target.dataset.c].c = e.target.value;
+});
+$('impm-c').addEventListener('click', () => { $('impm').hidden = true; });
+$('impm-ok').addEventListener('click', () => {
+  const sel = IMP.filter(x => x.on); if (!sel.length) { $('impm').hidden = true; return; }
+  if (!Array.isArray(S.cfix)) S.cfix = []; if (!Array.isArray(S.comp)) S.comp = [];
+  sel.forEach(x => {
+    if (x.c && !CATS.out.includes(x.c)) CATS.out.push(x.c);
+    const id = typeof uid === 'function' ? uid() : Date.now() + Math.random();
+    if (x.rep) S.cfix.push({ id, n: x.n, v: x.v, c: x.c, day: x.day || 0, from: x.from });
+    else S.comp.push({ id, n: x.n, v: x.v, c: x.c, d: x.date, m: x.date.slice(0, 7), st: 'a', rep: 0 });
+  });
+  if (S.cats && S.cats.out !== CATS.out) S.cats.out = CATS.out;
+  $('impm').hidden = true; save(); try { fillCats(); } catch (e) {} render(); try { renderCpv(); } catch (e) {}
+  say(sel.length + ' compromisso(s) criado(s). Eles aparecem em Compromissos e na Previsão.');
+});
+// redesenha a lista de transferências quando o mês muda
+const _render2 = window.render;
+window.render = function () { const r = _render2.apply(this, arguments); try { renderTrf(); } catch (e) {} return r; };
+
 
 // ------------------------------------------------------------------ início
 renderPg();

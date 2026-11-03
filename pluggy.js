@@ -14,13 +14,10 @@ try { CFG = JSON.parse(localStorage.getItem(LS) || '{}') || {}; } catch (e) {}
 const saveCfg = () => { try { localStorage.setItem(LS, JSON.stringify(CFG)); } catch (e) {} };
 const ready = () => !!(CFG.url && CFG.key);
 // Estado que vai junto com seus dados (e para o Firebase): nada secreto aqui.
-const P = () => {
-  if (!S.pg || typeof S.pg !== 'object') S.pg = {};
-  const p = S.pg;
-  p.accMap = p.accMap || {}; p.accounts = p.accounts || []; p.bills = p.bills || []; p.items = p.items || [];
-  if (p.auto === undefined) p.auto = true;
-  return p;
-};
+// P() só lê (não altera S, para não marcar os dados como modificados); PW() é usado quando vamos gravar.
+const PG0 = () => ({ accMap: {}, accounts: [], bills: [], items: [], auto: true });
+const P = () => (S.pg && typeof S.pg === 'object') ? Object.assign(PG0(), S.pg) : PG0();
+const PW = () => { S.pg = Object.assign(PG0(), (S.pg && typeof S.pg === 'object') ? S.pg : {}); return S.pg; };
 const hoje = () => today();
 const addD = (iso, n) => { const d = new Date(iso + 'T12:00:00'); d.setDate(d.getDate() + n); return d.toISOString().slice(0, 10); };
 const diffD = (a, b) => Math.round((new Date(b + 'T12:00:00') - new Date(a + 'T12:00:00')) / 864e5);
@@ -223,29 +220,25 @@ function paintTop(ym) {
 }
 
 // ------------------------------------------------------------------ previsão
-// Lê os compromissos do seu app sem depender do formato exato.
+// Compromissos do app: occ(mês) já junta os avulsos (S.comp) e os fixos que repetem (S.cfix).
+// st 'a' = a pagar; os atrasados aparecem no dia de hoje.
 function compEvents(from, to) {
-  const ev = [];
-  (S.comp || []).forEach((x, i) => {
-    if (!x || typeof x !== 'object') return;
-    const name = x.n || x.name || x.nome || x.desc || x.d_ || 'Compromisso';
-    const amount = Math.abs(+(x.v ?? x.val ?? x.valor ?? x.amount ?? x.a ?? 0));
-    const date = [x.dt, x.date, x.venc, x.due, x.data, x.d].find(v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v));
-    if (!date || !amount) return;
-    const repeat = !!(x.rp ?? x.rep ?? x.repeat ?? x.mensal ?? x.r);
-    const paid = x.paid || x.pg || x.pago || {};
-    const isPaid = k => paid === true || (typeof paid === 'object' && (paid[k] || paid[k.slice(0, 7)]));
-    const dir = (x.k || x.type || x.tp) === 'in' ? 'in' : 'out';
-    const day = +date.slice(8, 10);
-    const push = d => { if (d >= from && d <= to && !isPaid(d)) ev.push({ id: 'c' + (x.id ?? i) + ':' + d, date: d, name, amount, dir, src: 'Compromisso' }); };
-    if (repeat) {
-      for (let k = 0; k < 3; k++) {
-        const ym = mAdd(from.slice(0, 7), k), last = new Date(+ym.slice(0, 4), +ym.slice(5, 7), 0).getDate();
-        const d = ym + '-' + String(Math.min(day, last)).padStart(2, '0');
-        if (d >= date.slice(0, 10)) push(d);
-      }
-    } else push(date.slice(0, 10));
-  });
+  if (typeof occ !== 'function') return [];
+  const ev = [], seen = new Set();
+  const add = (x, date, late) => {
+    const id = 'c' + x.id; if (seen.has(id)) return; seen.add(id);
+    const amount = Math.abs(+x.v || 0); if (!amount) return;
+    ev.push({ id, date, name: x.n || 'Compromisso', amount, dir: 'out', src: late ? 'Atrasado' : 'Compromisso', cat: x.c });
+  };
+  // atrasados: só os do último mês (os mais antigos provavelmente foram pagos e não marcados)
+  const lim = addD(from, -31);
+  try { if (typeof lateOld === 'function') lateOld().forEach(x => { if (x.d >= lim) add(x, from, true); }); } catch (e) {}
+  for (let k = from.slice(0, 7); k <= to.slice(0, 7); k = mAdd(k, 1)) {
+    occ(k).forEach(x => {
+      if (x.st !== 'a' || !x.d) return;
+      if (x.d < from) { if (x.d >= lim) add(x, from, true); } else if (x.d <= to) add(x, x.d, false);
+    });
+  }
   return ev;
 }
 
@@ -295,7 +288,7 @@ let horizon = 30;
 function forecast() {
   const from = hoje(), to = addD(from, horizon);
   const comp = compEvents(from, to);
-  const ev = [...billEvents(from, to), ...comp, ...recurringEvents(from, to, comp.map(e => e.name))].sort((a, b) => a.date.localeCompare(b.date) || (a.dir === 'in' ? -1 : 1));
+  const ev = [...billEvents(from, to), ...comp, ...recurringEvents(from, to, [...comp.map(e => e.name), ...(S.comp || []).map(x => x.n), ...(S.cfix || []).map(x => x.n)].filter(Boolean).map(n => String(n).replace(/\s*\(\d+\/\d+\)$/, '')))].sort((a, b) => a.date.localeCompare(b.date) || (a.dir === 'in' ? -1 : 1));
   const bank = P().accounts.filter(a => a.type === 'BANK');
   const start = bank.length ? bank.reduce((s, a) => s + (+a.balance || 0), 0) : null;
   return { from, to, ev, start };
@@ -351,7 +344,7 @@ $('pg-hz').addEventListener('click', e => { const b = e.target.closest('[data-h]
 let remTimer = null, remLast = '';
 function queueReminders(ev) {
   if (!ready()) return;
-  const items = ev.filter(e => e.src !== 'Fatura' && e.src !== 'Fatura aberta').map(e => ({ id: e.id, name: e.name, amount: e.amount, date: e.date, dir: e.dir }));
+  const items = ev.filter(e => e.src === 'Compromisso' || e.src === 'Recorrente').map(e => ({ id: e.id, name: e.name, amount: e.amount, date: e.date, dir: e.dir }));
   const sig = JSON.stringify(items); if (sig === remLast) return;
   clearTimeout(remTimer);
   remTimer = setTimeout(() => api('/reminders', { method: 'PUT', body: JSON.stringify({ items }) }).then(() => remLast = sig).catch(() => {}), 2500);
@@ -406,7 +399,7 @@ function addSuggestedCats() {
 
 // ------------------------------------------------------------------ sincronização
 function cardFor(acc) {
-  const p = P();
+  const p = PW();
   if (p.accMap[acc.id] && S.cards.some(c => c.id === p.accMap[acc.id])) return p.accMap[acc.id];
   const nm = (acc.name || 'Cartão').replace(/\s+/g, ' ').trim().slice(0, 30);
   let c = S.cards.find(x => norm(x.name) === norm(nm)) || S.cards.find(x => norm(x.name).length > 2 && (norm(nm).includes(norm(x.name)) || norm(x.name).includes(norm(nm))));
@@ -433,7 +426,7 @@ let syncing = false;
 async function sync(opts = {}) {
   if (!ready() || syncing) return;
   syncing = true; setBusy(true);
-  const p = P();
+  const p = PW();
   try {
     const from = p.lastSync && !opts.full ? addD(p.lastSync.slice(0, 10), -15) : addD(hoje(), -90);
     const r = await api('/sync?from=' + from);
@@ -457,7 +450,7 @@ async function sync(opts = {}) {
     say(novas ? `${novas} movimentação(ões) nova(s): ${auto} lançada(s) sozinha(s), ${rev} para revisar.` : 'Tudo em dia. Nenhuma movimentação nova.');
     if (rev && opts.fromPush) goTab('rec');
   } catch (e) {
-    p.lastErr = e.message; renderPg(); say('Pluggy: ' + e.message, true);
+    PW().lastErr = e.message; renderPg(); say('Pluggy: ' + e.message, true);
   } finally { syncing = false; setBusy(false); }
 }
 function setBusy(b) { const x = $('pg-sync'); if (x) { x.disabled = b; x.textContent = b ? 'Sincronizando…' : 'Sincronizar agora'; } }
@@ -559,13 +552,13 @@ recSec.addEventListener('click', async e => {
   else if (b.id === 'pg-cfg') { CFG.key = ''; saveCfg(); renderPg(); }
   else if (b.dataset.pg === 'del') {
     if (b.dataset.arm !== '1') { b.dataset.arm = '1'; b.textContent = 'Confirmar?'; setTimeout(() => { b.dataset.arm = ''; b.textContent = 'Remover'; }, 3500); return; }
-    try { await api('/items/' + b.dataset.id, { method: 'DELETE' }); const p = P(); p.items = p.items.filter(i => i.id !== b.dataset.id); p.accounts = p.accounts.filter(a => a.itemId !== b.dataset.id); save(); renderPg(); say('Conexão removida. Os lançamentos já feitos continuam.'); } catch (err) { say(err.message, true); }
+    try { await api('/items/' + b.dataset.id, { method: 'DELETE' }); const p = PW(); p.items = p.items.filter(i => i.id !== b.dataset.id); p.accounts = p.accounts.filter(a => a.itemId !== b.dataset.id); save(); renderPg(); say('Conexão removida. Os lançamentos já feitos continuam.'); } catch (err) { say(err.message, true); }
   }
 });
 recSec.addEventListener('change', e => {
-  if (e.target.id === 'pg-auto') { P().auto = e.target.checked; save(); }
+  if (e.target.id === 'pg-auto') { PW().auto = e.target.checked; save(); }
   else if (e.target.dataset.acc) {
-    const p = P(), id = e.target.dataset.acc, card = isNaN(+e.target.value) ? e.target.value : +e.target.value;
+    const p = PW(), id = e.target.dataset.acc, card = isNaN(+e.target.value) ? e.target.value : +e.target.value;
     p.accMap[id] = card; S.rec.forEach(x => { if (x.acc === id && x.st === 'pend' && x.type === 'out') x.card = card; }); save(); say('Cartão vinculado.');
   }
 });

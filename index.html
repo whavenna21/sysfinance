@@ -1505,7 +1505,7 @@ leBase=leState();leReady=true;showLe();
 import{initializeApp}from"https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
 import{getAuth,onAuthStateChanged,signInWithEmailAndPassword,createUserWithEmailAndPassword,sendPasswordResetEmail,signOut}from"https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
 import{getFirestore,doc,getDoc,setDoc,deleteDoc}from"https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
-const app=initializeApp({apiKey:"AIzaSyCyL7rDgS58XejYjJ_vEdA97z72n4GJoWI",authDomain:"sistema-financeiro-59729.firebaseapp.com",projectId:"sistema-financeiro-59729",storageBucket:"sistema-financeiro-59729.firebasestorage.app",messagingSenderId:"701039353095",appId:"1:701039353095:web:865803023ae3fc9d0879a2"});
+const app=initializeApp({apiKey:"AIzaSyCuwiqdNuIIY6YXKdTZKo6pfRKHfHuInXk",authDomain:"sysfinance-edd4e.firebaseapp.com",projectId:"sysfinance-edd4e",storageBucket:"sysfinance-edd4e.firebasestorage.app",messagingSenderId:"633865908635",appId:"1:633865908635:web:b9d7d5575f56ff4c36b13e"});
 const auth=getAuth(app),db=getFirestore(app),ref=u=>doc(db,"users",u);
 window.FB={onAuthStateChanged:f=>onAuthStateChanged(auth,f),signIn:(e,p)=>signInWithEmailAndPassword(auth,e,p),signUp:(e,p)=>createUserWithEmailAndPassword(auth,e,p),reset:e=>sendPasswordResetEmail(auth,e),signOut:()=>signOut(auth),get:u=>getDoc(ref(u)),set:(u,d)=>setDoc(ref(u),d),del:u=>deleteDoc(ref(u))};
 window.dispatchEvent(new Event("fb-ready"));

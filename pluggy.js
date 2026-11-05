@@ -417,7 +417,9 @@ function toRec(t, accById) {
   if (t.status === 'PENDING') mv.pend = 1;
   if (t.isCard && type === 'out') mv.card = cardFor(acc);
   const n = norm(desc + ' ' + (t.category || '')), me = norm(S.myname || '');
-  if ((t.isCard && type === 'in' && /pagamento|payment|pgto/.test(n)) || INTERNAL.test(n) || (me.length > 3 && norm(desc).includes(me) && /transfer|pix|ted/.test(n))) mv.st = 'ign';
+  if (t.isCard && type === 'in' && /pagamento|payment|pgto/.test(n)) { mv.st = 'ign'; mv.why = 'pagamento da fatura recebido no cartão'; }
+  else if (INTERNAL.test(n)) { mv.st = 'ign'; mv.why = /fatura|credit card payment/.test(n) ? 'pagamento de fatura (as compras do cartão já contam)' : /investment|aplicac|resgate|cofrinho|reservado|retirado/.test(n) ? 'aplicação ou resgate' : 'transferência entre contas suas'; }
+  else if (me.length > 3 && norm(desc).includes(me) && /transfer|pix|ted/.test(n)) { mv.st = 'ign'; mv.why = 'transferência para você mesma'; }
   mv.dup = S.tx.some(x => x.type === type && Math.abs((x.gross || x.amount) - t.amount) < .005 && Math.abs(new Date(x.date) - new Date(t.date)) <= 864e5)
     || S.rec.some(x => x.src !== 'pluggy' && x.st === 'pend' && x.type === type && Math.abs(x.amount - t.amount) < .005 && x.date === t.date);
   if (!(recSug(mv) || {}).cat) { const c = mapCat(t.category, type); if (c) mv.cat = c; }
@@ -440,15 +442,21 @@ async function sync(opts = {}) {
     p.counts = {};
     (r.transactions || []).forEach(t => { const c = p.counts[t.accountId] = p.counts[t.accountId] || { n: 0, pe: 0 }; c.n++; if (t.status === 'PENDING') c.pe++; });
     // compra que veio pendente e agora chegou confirmada (com outro id): não lança de novo
-    const samePurchase = t => S.rec.find(x => x.pend && x.acc === t.accountId && !x.postedId && Math.abs(x.amount - t.amount) < .005 && Math.abs(new Date(x.date) - new Date(t.date)) <= 5 * 864e5);
+    const key8 = d => norm(typeof rkey === 'function' ? rkey(d || '') || d || '' : d || '').replace(/[^a-z]/g, '').slice(0, 8);
+    const similar = (a, b) => { const x = key8(a), y = key8(b); return !x || !y || x === y || x.startsWith(y) || y.startsWith(x); };
+    const near = (x, t, days) => x.acc === t.accountId && Math.abs(x.amount - t.amount) < .005 && Math.abs(new Date(x.date) - new Date(t.date)) <= days * 864e5 && similar(x.desc, t.desc || t.merchant);
+    const samePurchase = t => S.rec.find(x => x.pend && !x.postedId && near(x, t, 5));
+    // o Open Finance às vezes reemite a mesma compra pendente com outro id: não entra de novo
+    const samePending = t => S.rec.find(x => x.pend && x.src === 'pluggy' && near(x, t, 3));
     const have = new Set(S.rec.map(x => x.id));
-    let novas = 0, auto = 0, rev = 0;
+    let novas = 0, auto = 0, rev = 0, ign = 0;
     (r.transactions || []).sort((a, b) => a.date.localeCompare(b.date)).forEach(t => {
       if (have.has('p:' + t.id) || S.rec.some(x => x.postedId === t.id)) return;
       if (t.isCard && t.status !== 'PENDING') { const old = samePurchase(t); if (old) { old.postedId = t.id; old.pend = 0; return; } }
+      if (t.isCard && t.status === 'PENDING' && samePending(t)) return;
       const mv = toRec(t, accById); if (!mv) return;
       S.rec.push(mv); have.add(mv.id); novas++;
-      if (mv.st !== 'pend') return;
+      if (mv.st !== 'pend') { ign++; return; }
       const s = recSug(mv) || {}, cat = mv.cat || s.cat;
       if (p.auto && !mv.dup && cat) { recCommit(mv, cat, mv.kind === 'fatura' ? 'Cartão' : (s.pay && s.pay !== 'Cartão' ? s.pay : recPay(mv))); auto++; } else rev++;
     });
@@ -458,7 +466,7 @@ async function sync(opts = {}) {
     p.ver = 2;
     p.lastSync = new Date().toISOString(); p.lastErr = (r.errors || []).join(' · ') || null;
     save(); render(); renderRec(); renderPg();
-    say(novas ? `${novas} movimentação(ões) nova(s): ${auto} lançada(s) sozinha(s), ${rev} para revisar.` : 'Tudo em dia. Nenhuma movimentação nova.');
+    say(novas ? `${novas} movimentação(ões) nova(s): ${auto} lançada(s) sozinha(s), ${rev} para revisar${ign ? ', ' + ign + ' ignorada(s) por serem internas' : ''}. Veja em "Últimas do banco".` : 'Tudo em dia. Nenhuma movimentação nova desde a última atualização do banco.');
     if (rev && opts.fromPush) goTab('rec');
   } catch (e) {
     PW().lastErr = e.message; renderPg(); say('Pluggy: ' + e.message, true);
@@ -855,6 +863,288 @@ $('impm-ok').addEventListener('click', () => {
 // redesenha a lista de transferências quando o mês muda
 const _render2 = window.render;
 window.render = function () { const r = _render2.apply(this, arguments); try { renderTrf(); } catch (e) {} return r; };
+
+
+// ================================================================== ACESSOS E FILTROS
+// 1) Dependentes: veem só os vencimentos que você escolher  2) Filtro por categoria nos Compromissos
+// 3) "Pago por categoria" no Resumo
+document.head.insertAdjacentHTML('beforeend', `<style id="pga-css">
+#depc .dp{padding:12px 0;border-top:1px solid var(--ln)}#depc .dp:first-of-type{border-top:0}
+#depc .dp .rw{display:flex;justify-content:space-between;gap:8px;align-items:center}
+#depc details{margin-top:6px}#depc summary{cursor:pointer;color:var(--mu);font-size:.9rem}
+#depc .ck{display:flex;gap:8px;align-items:flex-start;padding:5px 0;font-size:.9rem}#depc .ck input{width:auto;min-height:0;margin-top:3px}
+#depc .ck small{display:block}#depc .gt{font-weight:700;font-size:.82rem;color:var(--mu);margin:10px 0 2px;text-transform:uppercase;letter-spacing:.03em}
+#depc .er{color:var(--out);font-size:.85rem}
+html.dep body>main{display:none!important}
+#depv{max-width:560px;margin:0 auto;padding:20px 16px 48px}
+#depv li{display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--ln);align-items:baseline}#depv li:first-child{border-top:0}
+#depv li small{display:block;font-size:.82rem}#depv .cg{font-weight:700;font-size:.82rem;color:var(--mu);margin:14px 0 4px;text-transform:uppercase;letter-spacing:.03em}
+#ppc-l li{display:grid;grid-template-columns:1fr auto;gap:2px 12px;padding:9px 0;border-top:1px solid var(--ln)}#ppc-l li:first-child{border-top:0}
+#ppc-l li small{grid-column:1/-1}#ppc-l li.ck{cursor:pointer}#ppc-l .pb{grid-column:1/-1;height:6px;border-radius:3px;background:var(--ln);overflow:hidden}#ppc-l .pb i{display:block;height:100%;background:var(--out)}
+#ppc .tot{display:flex;justify-content:space-between;margin:10px 0 4px;font-weight:700}
+#ppc .vt{border:0;background:none;color:var(--mu);text-decoration:underline;padding:0;min-height:0;font-size:.85rem}
+</style>`);
+const baseN = n => String(n || '').replace(/\s*\(\d+\/\d+\)$/, '');
+const lowEmail = e => String(e || '').trim().toLowerCase();
+const depList = () => (Array.isArray(S.dep) ? S.dep : []);   // só lê: não marca os dados como alterados
+
+// ---------- 1) Dependentes ----------
+// O que cada dependente vê: vencimentos dos próximos 60 dias, atrasados do último mês e o que já foi pago no mês.
+function depItems(d) {
+  if (typeof occ !== 'function') return [];
+  const sel = d.sel || {}, f = new Set((sel.f || []).map(String)), nm = new Set(sel.n || []), cats = new Set(sel.cats || []);
+  const ok = x => (x.rep && f.has(String(x.rep))) || (!x.rep && nm.has(norm(baseN(x.n)))) || cats.has(x.c);
+  const from = addD(hoje(), -31), to = addD(hoje(), 60), cur = hoje().slice(0, 7), out = [], seen = new Set();
+  for (let k = from.slice(0, 7); k <= to.slice(0, 7); k = mAdd(k, 1)) occ(k).forEach(x => {
+    if (!ok(x) || !x.d || seen.has(String(x.id)) || x.st === 'i') return;
+    if (x.st === 'g' && x.m !== cur) return;
+    if (x.st === 'a' && (x.d > to || x.d < from)) return;
+    seen.add(String(x.id));
+    out.push({ n: x.n, v: Math.round(((x.st === 'g' && x.pv) ? x.pv : x.v) * 100) / 100, d: x.d, st: x.st, c: x.c || '' });
+  });
+  return out.sort((a, b) => a.d.localeCompare(b.d));
+}
+const depSent = {}, depErr = {}, depOpen = new Set();
+let depT = null;
+function depPublish(now) {
+  clearTimeout(depT);
+  depT = setTimeout(async () => {
+    if (!window.FB || !FB.shSet || !window.cu) return;
+    for (const d of depList()) {
+      const body = { owner: cu.uid, ownerEmail: cu.email || '', ownerName: (S.myname || '').trim(), name: d.name || '', items: depItems(d) };
+      const sig = JSON.stringify(body); if (depSent[d.email] === sig) continue;
+      try { await FB.shSet(d.email, { ...body, updatedAt: Date.now() }); depSent[d.email] = sig; delete depErr[d.email]; }
+      catch (e) { depErr[d.email] = e && e.code === 'permission-denied' ? 'O Firebase recusou o envio: atualize as regras do Firestore (veja o guia).' : 'Não consegui enviar agora; tento de novo na próxima alteração.'; }
+    }
+    if (!$('rec').hidden) renderDep();
+  }, now ? 0 : 2500);
+}
+// toda vez que os dados vão para a nuvem, a lista dos dependentes é atualizada junto
+const _cloudPush = window.cloudPush;
+window.cloudPush = function () { const r = _cloudPush ? _cloudPush.apply(this, arguments) : undefined; if (depList().length) depPublish(); return r; };
+
+function compChoices() {
+  const cur = hoje().slice(0, 7), lim = addD(hoje(), -31);
+  const fx = (S.cfix || []).filter(t => !t.to || t.to >= cur).map(t => ({ key: 'f:' + t.id, n: t.n, v: t.v, c: t.c || '', info: 'todo mês, dia ' + (t.day || '—') }));
+  const av = {};
+  (S.comp || []).filter(x => !x.rep && x.st === 'a' && x.d && x.d >= lim).forEach(x => {
+    const k = norm(baseN(x.n));
+    if (!av[k] || x.d < av[k].d) av[k] = { key: 'n:' + k, n: baseN(x.n), v: x.v, c: x.c || '', d: x.d, info: 'próximo ' + dBR(x.d) };
+  });
+  return [...fx, ...Object.values(av)].sort((a, b) => a.c.localeCompare(b.c) || a.n.localeCompare(b.n));
+}
+const isSel = (d, key) => { const s = d.sel || {}; return key.startsWith('f:') ? (s.f || []).map(String).includes(key.slice(2)) : (s.n || []).includes(key.slice(2)); };
+
+$('pgc').insertAdjacentHTML('afterend', '<div class="card" id="depc"></div>');
+function renderDep() {
+  const el = $('depc'); if (!el) return;
+  const list = depList(), ch = compChoices(), cats = [...new Set(ch.map(x => x.c).filter(Boolean))].sort();
+  const typedE = $('dep-e') ? $('dep-e').value : '', typedN = $('dep-n') ? $('dep-n').value : '';
+  el.innerHTML = `<h2>Acesso de dependentes</h2>
+    <small style="display:block;margin-bottom:8px">Quem você adicionar entra no app com o próprio e-mail e senha e vê <b>só os vencimentos que você marcar</b>: nada de saldos, lançamentos, bancos ou cartões.</small>
+    ${list.map(d => {
+      const n = depItems(d).filter(x => x.st === 'a').length, s = d.sel || {};
+      return `<div class="dp" data-de="${esc(d.email)}"><div class="rw"><span><b>${esc(d.name || d.email)}</b>${d.name ? `<small style="display:block">${esc(d.email)}</small>` : ''}</span><button class="sm" data-dep="del" type="button">Remover</button></div>
+        <small>Vê ${n} vencimento(s) a pagar nos próximos 60 dias.${(s.cats || []).length ? ' Categorias inteiras: ' + esc(s.cats.join(', ')) + '.' : ''}</small>
+        ${depErr[d.email] ? `<p class="er">${esc(depErr[d.email])}</p>` : ''}
+        <details${depOpen.has(d.email) ? ' open' : ''}><summary>Escolher o que ${esc(d.name || 'ele')} vê</summary>
+          ${cats.length ? `<div class="gt">Categorias inteiras (inclui as contas que você criar depois)</div>${cats.map(c => `<label class="ck"><input type="checkbox" data-dc="${esc(c)}"${(s.cats || []).includes(c) ? ' checked' : ''}><span>${esc(c)}</span></label>`).join('')}` : ''}
+          <div class="gt">Contas específicas</div>
+          ${ch.length ? ch.map(x => `<label class="ck"><input type="checkbox" data-dk="${esc(x.key)}"${isSel(d, x.key) || (s.cats || []).includes(x.c) ? ' checked' : ''}${(s.cats || []).includes(x.c) ? ' disabled' : ''}><span>${esc(x.n)} · ${fmt(x.v)}<small>${esc(x.c)} · ${esc(x.info)}</small></span></label>`).join('') : '<p class="pgempty">Nenhum compromisso cadastrado ainda.</p>'}
+        </details></div>`;
+    }).join('') || '<p class="pgempty">Nenhum dependente ainda.</p>'}
+    <input id="dep-e" type="email" placeholder="E-mail do dependente" aria-label="E-mail do dependente" style="margin-top:10px" autocomplete="off" value="${esc(typedE)}">
+    <input id="dep-n" placeholder="Nome (opcional)" aria-label="Nome do dependente" style="margin-top:8px" value="${esc(typedN)}">
+    <button class="go" id="dep-add" type="button" style="margin-top:10px">Adicionar dependente</button>
+    <small style="display:block;margin-top:8px">Depois de adicionar, crie o login dele no Firebase: <b>Authentication → Usuários → Adicionar usuário</b>, com esse mesmo e-mail e uma senha. Passe a senha para ele.</small>`;
+}
+$('depc').addEventListener('toggle', e => { const dp = e.target.closest && e.target.closest('.dp'); if (dp && e.target.tagName === 'DETAILS') { if (e.target.open) depOpen.add(dp.dataset.de); else depOpen.delete(dp.dataset.de); } }, true);
+$('depc').addEventListener('click', async e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.id === 'dep-add') {
+    const em = lowEmail($('dep-e').value), nm = $('dep-n').value.replace(/\s+/g, ' ').trim().slice(0, 40);
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) { say('Digite um e-mail válido.', true); return; }
+    if (window.cu && lowEmail(cu.email) === em) { say('Esse é o seu próprio e-mail.', true); return; }
+    if (depList().some(d => d.email === em)) { say('Esse dependente já está na lista.', true); return; }
+    S.dep = [...depList(), { email: em, name: nm, sel: { f: [], n: [], cats: [] } }];
+    $('dep-e').value = ''; $('dep-n').value = ''; depOpen.add(em);
+    save(); renderDep(); depPublish(true);
+    say('Dependente adicionado. Agora marque o que ele pode ver e crie o login dele no Firebase.');
+  } else if (b.dataset.dep === 'del') {
+    if (b.dataset.arm !== '1') { b.dataset.arm = '1'; b.textContent = 'Confirmar?'; setTimeout(() => { b.dataset.arm = ''; b.textContent = 'Remover'; }, 3500); return; }
+    const em = b.closest('.dp').dataset.de;
+    S.dep = depList().filter(d => d.email !== em); delete depSent[em]; depOpen.delete(em); save(); renderDep();
+    try { await FB.shDel(em); say('Dependente removido. Ele não vê mais nada.'); } catch (err) { say('Removido da lista, mas não consegui apagar o compartilhamento agora.', true); }
+  }
+});
+$('depc').addEventListener('change', e => {
+  const dp = e.target.closest('.dp'); if (!dp) return;
+  const d = depList().find(x => x.email === dp.dataset.de); if (!d) return;
+  d.sel = d.sel || {}; ['f', 'n', 'cats'].forEach(k => { d.sel[k] = d.sel[k] || []; });
+  const on = e.target.checked;
+  if (e.target.dataset.dc !== undefined) { const c = e.target.dataset.dc; d.sel.cats = on ? [...new Set([...d.sel.cats, c])] : d.sel.cats.filter(x => x !== c); }
+  else if (e.target.dataset.dk !== undefined) {
+    const k = e.target.dataset.dk, arr = k.startsWith('f:') ? 'f' : 'n', v = k.slice(2);
+    d.sel[arr] = on ? [...new Set([...d.sel[arr].map(String), v])] : d.sel[arr].map(String).filter(x => x !== v);
+  } else return;
+  save(); renderDep();
+});
+// a lista é redesenhada ao abrir a aba ⚙ (e não a cada render, para não apagar o que está sendo digitado)
+nav.querySelector('[data-t=rec]').addEventListener('click', () => { try { renderDep(); } catch (e) {} });
+
+// Tela do dependente: só os vencimentos compartilhados
+document.body.insertAdjacentHTML('beforeend', '<div id="depv" hidden></div>');
+let depData = null;
+function renderDepView() {
+  const data = depData || {}, t = hoje(), items = data.items || [];
+  const late = items.filter(x => x.st === 'a' && x.d < t), next = items.filter(x => x.st === 'a' && x.d >= t), paid = items.filter(x => x.st === 'g');
+  const row = x => {
+    const n = diffD(t, x.d), s = x.st === 'g' ? ['Pago', 'var(--in)'] : n < 0 ? ['Atrasada há ' + (-n) + (n === -1 ? ' dia' : ' dias'), 'var(--out)'] : n === 0 ? ['Vence hoje', 'var(--am)'] : ['Vence em ' + n + (n === 1 ? ' dia' : ' dias'), 'var(--am)'];
+    return `<li><span><b>${esc(x.n)}</b><small style="color:${s[1]}">${s[0]} · ${dBR(x.d)}${x.c ? ' · ' + esc(x.c) : ''}</small></span><b>${fmt(x.v)}</b></li>`;
+  };
+  const sec = (tt, l) => l.length ? `<div class="cg">${tt}</div><ul>${l.map(row).join('')}</ul>` : '';
+  const aPagar = [...late, ...next].reduce((a, x) => a + x.v, 0);
+  const quem = data.ownerName || data.ownerEmail || '';
+  $('depv').innerHTML = `<header style="margin-bottom:16px"><h1>Próximos vencimentos</h1></header>
+    <section class="tape"><div class="lbl">A pagar nos próximos 60 dias</div><div class="big">${fmt(aPagar)}</div>
+      <div class="row"><span>${late.length} atrasado(s)</span><span>${next.length} a vencer</span></div></section>
+    <div class="card">${sec('Atrasados', late) + sec('A vencer', next) + sec('Pagos neste mês', paid) || '<p class="mi">Nenhum vencimento compartilhado com você.</p>'}</div>
+    <small style="display:block;margin:4px 0 16px">${quem ? 'Compartilhado por ' + esc(quem) + '. ' : ''}${data.updatedAt ? 'Atualizado em ' + new Date(data.updatedAt).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) + '.' : ''}</small>
+    <div class="bk"><button id="depv-r" type="button">Atualizar</button><button id="depv-out" type="button">Sair da conta</button></div>`;
+}
+async function depFetch(u) {
+  const r = await FB.shGet(lowEmail(u.email));
+  return r.exists() && r.data().owner !== u.uid ? r.data() : null;
+}
+function enterDep(data) { depData = data; document.documentElement.classList.add('dep'); $('depv').hidden = false; renderDepView(); }
+function leaveDep() { if (!document.documentElement.classList.contains('dep')) return; document.documentElement.classList.remove('dep'); $('depv').hidden = true; depData = null; }
+$('depv').addEventListener('click', async e => {
+  if (e.target.id === 'depv-r') { try { const d = await depFetch(FB.me()); if (d) { depData = d; renderDepView(); say('Atualizado.'); } } catch (err) { say('Não consegui atualizar agora.', true); } }
+  if (e.target.id === 'depv-out') { try { await FB.signOut(); } catch (err) {} try { localStorage.removeItem('caixa-v1'); } catch (err) {} location.reload(); }
+});
+function depBoot() {
+  if (!FB.shGet) return;
+  FB.onAuthStateChanged(async u => {
+    if (!u) { leaveDep(); return; }
+    let d = null; try { d = await depFetch(u); } catch (e) { /* sem permissão ou sem internet: conta normal */ }
+    if (d) { enterDep(d); return; }
+    leaveDep(); if (depList().length) depPublish(true);
+  });
+}
+if (window.FB) depBoot(); else addEventListener('fb-ready', depBoot, { once: true });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && depData && window.FB && FB.me()) depFetch(FB.me()).then(d => { if (d) { depData = d; renderDepView(); } }).catch(() => {}); });
+
+// ---------- 2) Compromissos: filtro por categoria ----------
+let cpvCat = '';
+const _renderCpv2 = window.renderCpv;
+window.renderCpv = function () { const r = _renderCpv2.apply(this, arguments); try { cpvFilter(); } catch (e) { console.error(e); } return r; };
+function cpvFilter() {
+  const card = $('cpv').querySelector('.card'); if (!card || card.id === 'impc') return;
+  const cats = [...new Set([...(S.cfix || []).map(t => t.c), ...(S.comp || []).map(x => x.c)].filter(Boolean))].sort();
+  if (!cats.length) return;
+  if (cpvCat && !cats.includes(cpvCat)) cpvCat = '';
+  const head = card.firstElementChild;
+  head.insertAdjacentHTML('afterend', `<select id="cpv-cat" aria-label="Filtrar compromissos por categoria" style="margin:12px 0 2px"><option value="">Todas as categorias</option>${cats.map(c => `<option${c === cpvCat ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select>`);
+  if (!cpvCat) return;
+  let sum = 0, any = false;
+  card.querySelectorAll('.cr[data-id]').forEach(el => {
+    const x = fnd(el.dataset.id), w = el.parentElement, show = !!x && x.c === cpvCat;
+    w.style.display = show ? '' : 'none';
+    if (show) { any = true; if (x.st === 'a') sum += x.v; }
+  });
+  card.querySelectorAll('.cg').forEach(g => {
+    let n = g.nextElementSibling, vis = false;
+    while (n && !n.classList.contains('cg')) { if (n.style.display !== 'none' && n.querySelector('.cr')) vis = true; n = n.nextElementSibling; }
+    g.style.display = vis ? '' : 'none';
+  });
+  const big = head.querySelector('.big'), sm = head.querySelector('small');
+  if (big) big.textContent = fmt(sum); if (sm) sm.textContent += ' · ' + cpvCat;
+  if (!any) card.insertAdjacentHTML('beforeend', `<p class="mi" style="margin-top:12px">Nenhum compromisso de ${esc(cpvCat)} neste mês.</p>`);
+}
+document.addEventListener('change', e => { if (e.target.id === 'cpv-cat') { cpvCat = e.target.value; renderCpv(); } });
+
+// ---------- 3) Resumo: pago por categoria ----------
+let ppcCat = '', ppcPay = '';
+$('ocard').insertAdjacentHTML('afterend', `<div class="card" id="ppc"><h2>Pago por categoria</h2>
+  <small style="display:block">Tudo o que saiu no mês, inclusive compromissos marcados como pagos. Toque numa categoria para ver o que tem dentro.</small>
+  <div class="g2" style="margin-top:10px"><select id="ppc-c" aria-label="Categoria"></select>
+  <select id="ppc-p" aria-label="Forma de pagamento"><option value="">Todas as formas</option><option value="cr">Crédito (cartão)</option><option value="db">Débito, Pix e dinheiro</option></select></div>
+  <div id="ppc-t"></div><ul id="ppc-l"></ul></div>`);
+function renderPpc() {
+  if (!$('ppc')) return;
+  let tx = monthTx(m).filter(t => t.type === 'out');
+  if (ppcPay === 'cr') tx = tx.filter(isCredit); else if (ppcPay === 'db') tx = tx.filter(t => !isCredit(t));
+  const by = {}; tx.forEach(t => { const c = t.cat || 'Sem categoria'; (by[c] = by[c] || { c, v: 0, n: 0 }); by[c].v += val(t); by[c].n++; });
+  const cats = Object.values(by).sort((a, b) => b.v - a.v);
+  if (ppcCat && !by[ppcCat]) ppcCat = '';
+  $('ppc-c').innerHTML = '<option value="">Todas as categorias</option>' + cats.map(c => `<option${c.c === ppcCat ? ' selected' : ''}>${esc(c.c)}</option>`).join('');
+  $('ppc-p').value = ppcPay;
+  const total = cats.reduce((a, c) => a + c.v, 0);
+  if (!ppcCat) {
+    $('ppc-t').innerHTML = `<div class="tot"><span>Total pago no mês</span><span>${fmt(total)}</span></div>`;
+    $('ppc-l').innerHTML = cats.length ? cats.map(c => `<li class="ck" data-pc="${esc(c.c)}"><span><b>${esc(c.c)}</b> <small style="display:inline">${c.n} lançamento(s)</small></span><b>${fmt(c.v)}</b><span class="pb"><i style="width:${(c.v / (cats[0].v || 1) * 100).toFixed(1)}%"></i></span></li>`).join('') : '<li class="pgempty" style="display:block">Nenhuma despesa neste mês.</li>';
+    return;
+  }
+  const list = tx.filter(t => (t.cat || 'Sem categoria') === ppcCat).sort((a, b) => b.date.localeCompare(a.date) || val(b) - val(a));
+  $('ppc-t').innerHTML = `<div class="tot"><span>${esc(ppcCat)} · ${list.length} lançamento(s)</span><span>${fmt(by[ppcCat].v)}</span></div><button class="vt" type="button" data-pc="">← Todas as categorias</button>`;
+  $('ppc-l').innerHTML = list.map(t => `<li><span>${esc(t.desc || '')}</span><b>${fmt(val(t))}</b><small>${dBR(t.date)}${typeof payLabel === 'function' && payLabel(t) ? ' · ' + esc(payLabel(t)) : ''}</small></li>`).join('');
+}
+$('ppc').addEventListener('click', e => { const el = e.target.closest('[data-pc]'); if (el) { ppcCat = el.dataset.pc; renderPpc(); } });
+$('ppc').addEventListener('change', e => { if (e.target.id === 'ppc-c') ppcCat = e.target.value; if (e.target.id === 'ppc-p') ppcPay = e.target.value; renderPpc(); });
+const _render3 = window.render;
+window.render = function () { const r = _render3.apply(this, arguments); try { renderPpc(); } catch (e) { console.error(e); } return r; };
+renderDep(); renderPpc();
+
+
+// ================================================================== ÚLTIMAS DO BANCO
+// Mostra o que aconteceu com cada movimentação que chegou do banco e deixa trazer de volta o que foi ignorado.
+document.head.insertAdjacentHTML('beforeend', `<style id="pgr-css">
+#rcn .pgseg{margin:8px 0}#rcn li{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:9px 0;border-top:1px solid var(--ln)}#rcn li:first-child{border-top:0}
+#rcn li small{grid-column:1/-1}#rcn li .ac{grid-column:1/-1;justify-self:start;border:0;background:none;color:var(--in);text-decoration:underline;padding:0;min-height:0;font-size:.85rem;font-weight:600}
+#rcn b.in{color:var(--in)}#rcn b.out{color:var(--out)}#rcn .st{font-weight:600}
+</style>`);
+// guarda em qual categoria cada item foi lançado (para mostrar aqui)
+if (typeof window.recCommit === 'function') {
+  const _rc = window.recCommit;
+  window.recCommit = function (x, cat) { const r = _rc.apply(this, arguments); try { if (x && x.src === 'pluggy') x.lc = cat; } catch (e) {} return r; };
+}
+$('rcl').closest('.card').insertAdjacentHTML('afterend', `<div class="card" id="rcn"><h2>Últimas do banco</h2>
+  <small id="rcn-i" style="display:block"></small>
+  <div class="pgseg" id="rcn-f"><button type="button" data-f="all">Todas</button><button type="button" data-f="done">Lançadas</button><button type="button" data-f="pend">Pendentes</button><button type="button" data-f="ign">Ignoradas</button></div>
+  <ul id="rcn-l"></ul><button class="sm" id="rcn-more" type="button" hidden style="width:100%;margin-top:8px">Mostrar mais</button></div>`);
+let rcnF = 'all', rcnN = 40;
+function renderRecent() {
+  if (!$('rcn')) return;
+  const p = P(), accN = id => (p.accounts.find(a => a.id === id) || {}).name || '';
+  const ups = (p.items || []).map(i => i.lastUpdatedAt).filter(Boolean).sort();
+  $('rcn-i').textContent = 'Os bancos chegam pelo Meu Pluggy, que atualiza uma vez por dia: uma compra de hoje pode levar até 24h (no cartão, às vezes 1 a 2 dias).' + (ups.length ? ' Última atualização dos bancos: ' + new Date(ups.at(-1)).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) + '.' : '');
+  document.querySelectorAll('#rcn-f button').forEach(b => b.setAttribute('aria-pressed', b.dataset.f === rcnF));
+  const lim = addD(hoje(), -45);
+  let l = S.rec.filter(x => x.src === 'pluggy' && x.date >= lim);
+  if (rcnF !== 'all') l = l.filter(x => x.st === rcnF);
+  l.sort((a, b) => b.date.localeCompare(a.date));
+  const st = x => x.st === 'pend' ? ['Pendente: escolha a categoria lá em cima', 'var(--am)']
+    : x.st === 'done' ? [x.trf ? 'Virou transferência' : 'Lançada' + (x.lc ? ' em ' + x.lc : ''), 'var(--in)']
+    : [x.why ? 'Ignorada automaticamente: ' + x.why : 'Ignorada', 'var(--mu)'];
+  $('rcn-l').innerHTML = l.slice(0, rcnN).map(x => {
+    const s = st(x);
+    return `<li data-rid="${esc(x.id)}"><span>${esc(x.desc)}</span><b class="${x.type}">${x.type === 'out' ? '−' : '+'}${fmt(x.amount)}</b>
+      <small>${dBR(x.date)}${accN(x.acc) ? ' · ' + esc(accN(x.acc)) : ''} · <span class="st" style="color:${s[1]}">${esc(s[0])}</span></small>
+      ${x.st === 'ign' ? '<button class="ac" type="button" data-back="1">Trazer de volta para categorizar</button>' : ''}</li>`;
+  }).join('') || '<li class="pgempty" style="display:block">Nada nos últimos 45 dias com esse filtro.</li>';
+  $('rcn-more').hidden = l.length <= rcnN;
+}
+$('rcn').addEventListener('click', e => {
+  const f = e.target.closest('#rcn-f [data-f]'); if (f) { rcnF = f.dataset.f; rcnN = 40; renderRecent(); return; }
+  if (e.target.id === 'rcn-more') { rcnN += 40; renderRecent(); return; }
+  if (e.target.dataset.back) {
+    const x = S.rec.find(v => v.id === e.target.closest('li').dataset.rid); if (!x) return;
+    x.st = 'pend'; delete x.why; save(); renderRec(); renderRecent(); say('Voltou para Pendentes: escolha a categoria lá em cima.');
+  }
+});
+const _renderRec2 = window.renderRec;
+window.renderRec = function () { const r = _renderRec2.apply(this, arguments); try { renderRecent(); } catch (e) { console.error(e); } return r; };
+renderRecent();
 
 
 // ------------------------------------------------------------------ início

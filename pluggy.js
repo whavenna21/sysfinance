@@ -273,7 +273,8 @@ function recurringEvents(from, to, skipNames) {
 
 function billEvents(from, to) {
   const p = P(), ev = [];
-  p.accounts.filter(a => a.type === 'CREDIT').forEach(a => {
+  // cartões com fechamento e vencimento cadastrados usam a fatura calculada pelo app (cardBillEvents)
+  p.accounts.filter(a => a.type === 'CREDIT' && !cardCfg(p.accMap[a.id])).forEach(a => {
     const bills = p.bills.filter(b => b.accountId === a.id && b.dueDate >= from && b.dueDate <= to);
     const seen = new Set();
     bills.forEach(b => { seen.add(b.dueDate); ev.push({ id: 'b:' + b.id, date: b.dueDate, name: 'Fatura ' + a.name, amount: b.total, dir: 'out', src: 'Fatura' }); });
@@ -281,7 +282,7 @@ function billEvents(from, to) {
     if (due && due >= from && due <= to && !seen.has(due) && Math.abs(a.balance || 0) > 0)
       ev.push({ id: 'b:' + a.id + ':' + due, date: due, name: 'Fatura ' + a.name, amount: Math.abs(a.balance), dir: 'out', src: 'Fatura aberta' });
   });
-  return ev;
+  return ev.concat(cardBillEvents(from, to));
 }
 
 let horizon = 30;
@@ -344,7 +345,7 @@ $('pg-hz').addEventListener('click', e => { const b = e.target.closest('[data-h]
 let remTimer = null, remLast = '';
 function queueReminders(ev) {
   if (!ready()) return;
-  const items = ev.filter(e => e.src === 'Compromisso' || e.src === 'Recorrente').map(e => ({ id: e.id, name: e.name, amount: e.amount, date: e.date, dir: e.dir }));
+  const items = ev.filter(e => e.src === 'Compromisso' || e.src === 'Recorrente' || e.src === 'Fatura do cartão').map(e => ({ id: e.id, name: e.name, amount: e.amount, date: e.date, dir: e.dir }));
   const sig = JSON.stringify(items); if (sig === remLast) return;
   clearTimeout(remTimer);
   remTimer = setTimeout(() => api('/reminders', { method: 'PUT', body: JSON.stringify({ items }) }).then(() => remLast = sig).catch(() => {}), 2500);
@@ -1145,6 +1146,177 @@ $('rcn').addEventListener('click', e => {
 const _renderRec2 = window.renderRec;
 window.renderRec = function () { const r = _renderRec2.apply(this, arguments); try { renderRecent(); } catch (e) { console.error(e); } return r; };
 renderRecent();
+
+
+// ================================================================== CARTÕES E FATURAS + CARD PRINCIPAL
+// Cada cartão tem dia de fechamento e de vencimento. Toda compra no cartão cai na fatura certa:
+// comprou antes do fechamento → fatura que fecha neste mês; no dia do fechamento ou depois → a próxima.
+document.head.insertAdjacentHTML('beforeend', `<style id="pgk-css">
+#cdc .cd{padding:12px 0;border-top:1px solid var(--ln)}#cdc .cd:first-of-type{border-top:0}
+#cdc .g3{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}#cdc .g3 label{display:flex;flex-direction:column;font-size:.8rem;color:var(--mu);gap:2px}
+#cdc .g3 input,#cdc .g3 select{min-height:38px;padding:6px 10px}#cdc .full{grid-column:1/-1}
+#cdc .fb{display:grid;grid-template-columns:1fr auto;gap:2px 10px;margin-top:10px;padding:10px 12px;border:1px solid var(--ln);border-radius:10px}
+#cdc .fb small{grid-column:1/-1}#cdc .fb .ac{grid-column:1/-1;justify-self:start;border:0;background:none;color:var(--in);text-decoration:underline;padding:0;min-height:0;font-size:.85rem;font-weight:600}
+.tape .row b.pos{color:#3DD68C}
+</style>`);
+const lastDay = (y, mo) => new Date(y, mo, 0).getDate();
+const ymd = (y, mo, d) => { while (mo > 12) { mo -= 12; y++; } while (mo < 1) { mo += 12; y--; } return y + '-' + String(mo).padStart(2, '0') + '-' + String(Math.min(d, lastDay(y, mo))).padStart(2, '0'); };
+function cardCfg(id) { const c = (S.cards || []).find(x => String(x.id) === String(id)); return c && c.fech > 0 && c.venc > 0 ? c : null; }
+// fatura de uma compra: datas de fechamento e vencimento
+function billOf(c, date) {
+  const y = +date.slice(0, 4), mo = +date.slice(5, 7), d = +date.slice(8, 10);
+  const closeM = d < Math.min(c.fech, lastDay(y, mo)) ? mo : mo + 1;
+  const close = ymd(y, closeM, c.fech), cy = +close.slice(0, 4), cm = +close.slice(5, 7);
+  const due = ymd(cy, c.venc > c.fech ? cm : cm + 1, c.venc);
+  return { close, due, key: due.slice(0, 7) };
+}
+const cardTx = c => S.tx.filter(t => t.type === 'out' && t.pay === 'Cartão' && String(t.card) === String(c.id));
+// todas as faturas de um cartão (por mês de vencimento)
+function billsOfCard(c) {
+  const B = {};
+  cardTx(c).forEach(t => { const b = billOf(c, t.date); (B[b.key] = B[b.key] || { ...b, L: [], v: 0 }); B[b.key].L.push(t); B[b.key].v += t.amount; });
+  return B;
+}
+const linkedAcc = c => { const p = P(); return Object.keys(p.accMap || {}).find(a => String(p.accMap[a]) === String(c.id) && p.accounts.some(x => x.id === a)); };
+const bankBill = (c, key) => { const a = linkedAcc(c); if (!a) return null; return P().bills.find(b => b.accountId === a && b.dueDate && b.dueDate.slice(0, 7) === key) || null; };
+const fatPaid = (c, key) => ((S.fatPg || {})[c.id] || {})[key];
+// pagamento de fatura que chegou do banco (ignorado automaticamente) e bate com o valor → fatura paga
+function autoPaid(c, key, total, due) {
+  if (!total) return null;
+  const x = S.rec.find(r => r.src === 'pluggy' && r.type === 'out' && /fatura/.test(norm(r.desc + ' ' + (r.why || ''))) && Math.abs(r.amount - total) <= Math.max(1, total * .02) && Math.abs(diffD(due, r.date)) <= 10);
+  return x ? { v: x.amount, d: x.date, auto: 1 } : null;
+}
+function billInfo(c, key) {
+  const B = billsOfCard(c), b = B[key] || (() => { const due = ymd(+key.slice(0, 4), +key.slice(5, 7), c.venc); const cm = c.venc > c.fech ? +key.slice(5, 7) : +key.slice(5, 7) - 1; return { key, due, close: ymd(+key.slice(0, 4), cm, c.fech), L: [], v: 0 }; })();
+  const bk = bankBill(c, key), total = bk && bk.total ? bk.total : b.v;
+  const pg = fatPaid(c, key) || autoPaid(c, key, total, b.due);
+  return { ...b, bank: bk, total, paid: pg || null };
+}
+function cardBillEvents(from, to) {
+  const ev = [];
+  (S.cards || []).filter(c => cardCfg(c.id)).forEach(c => {
+    for (let k = from.slice(0, 7); k <= to.slice(0, 7); k = mAdd(k, 1)) {
+      const b = billInfo(c, k);
+      if (b.paid || !b.total || b.due < from || b.due > to) continue;
+      ev.push({ id: 'fc:' + c.id + ':' + k, date: b.due, name: 'Fatura ' + c.name, amount: Math.round(b.total * 100) / 100, dir: 'out', src: linkedAcc(c) ? 'Fatura' : 'Fatura do cartão' });
+    }
+  });
+  return ev;
+}
+
+// ---------- Resumo → "Faturas dos cartões": agora pela data de vencimento ----------
+const _renderFat = window.renderFat;
+window.renderFat = function () {
+  if (!(S.cards || []).some(c => cardCfg(c.id))) return _renderFat.apply(this, arguments);
+  const G = [];
+  (S.cards || []).forEach(c => {
+    if (cardCfg(c.id)) { const b = billInfo(c, m); if (b.L.length || b.total) G.push({ key: String(c.id), name: c.name, id: c.id, L: b.L, sub: `Vence ${dBR(b.due)} · fecha ${dBR(b.close)} · ${b.L.length} compra(s)${b.bank ? ' · banco: ' + fmt(b.bank.total) : ''}${b.paid ? ' · paga' : ''}`, v: b.total }); }
+    else { const L = cardTx(c).filter(t => t.date.slice(0, 7) === m); if (L.length) G.push({ key: String(c.id), name: c.name, id: c.id, L, sub: `Compras de ${dBR(m + '-01').slice(3)} · cadastre fechamento e vencimento em ⚙`, v: L.reduce((a, t) => a + t.amount, 0) }); }
+  });
+  const none = S.tx.filter(t => t.type === 'out' && t.pay === 'Cartão' && t.date.slice(0, 7) === m && !(S.cards || []).some(c => String(c.id) === String(t.card)));
+  if (none.length) G.push({ key: 'none', name: 'Sem cartão definido', id: null, L: none, sub: none.length + ' lançamento(s)', v: none.reduce((a, t) => a + t.amount, 0) });
+  G.sort((a, b) => b.v - a.v);
+  $('ftot').textContent = fmt(G.reduce((a, g) => a + g.v, 0));
+  $('fat').innerHTML = G.length ? G.map(g => {
+    const open = openFat === g.key;
+    return `<li><div class="rw"><button type="button" class="cn" data-f="${esc(g.key)}" aria-expanded="${open}">${esc(g.name)} <span aria-hidden="true">${open ? '▾' : '▸'}</span></button><b class="out">${fmt(g.v)}</b></div><div class="rw sub" data-f="${esc(g.key)}"><small>${esc(g.sub)}</small>${g.id ? `<button type="button" class="lnk" data-fe="${g.id}">Editar cartão</button>` : '<small></small>'}</div>${open && g.L.length ? detailFat(g) : ''}</li>`;
+  }).join('') : '<li class="empty">Nenhuma fatura vence neste mês.</li>';
+};
+
+// ---------- ⚙ → Cartões de crédito ----------
+$('depc').insertAdjacentHTML('beforebegin', '<div class="card" id="cdc"></div>');
+function renderCards() {
+  const el = $('cdc'); if (!el) return;
+  const p = P(), credit = p.accounts.filter(a => a.type === 'CREDIT');
+  const cur = hoje().slice(0, 7);
+  el.innerHTML = `<h2>Cartões de crédito</h2>
+    <small style="display:block">Com o dia de fechamento e de vencimento, cada compra no cartão entra na fatura certa, a fatura aparece na Previsão e em "Falta pagar", e você é avisada antes de vencer.</small>
+    ${(S.cards || []).map(c => {
+      const acc = linkedAcc(c), a = acc && p.accounts.find(x => x.id === acc), cfg = cardCfg(c.id);
+      const sugF = a && a.credit && a.credit.closeDate ? +a.credit.closeDate.slice(8, 10) : '', sugV = a && a.credit && a.credit.dueDate ? +a.credit.dueDate.slice(8, 10) : '';
+      let bills = '';
+      if (cfg) {
+        const keys = [...new Set([cur, mAdd(cur, 1), ...Object.keys(billsOfCard(c)).filter(k => k >= mAdd(cur, -1))])].sort().slice(0, 4);
+        bills = keys.map(k => { const b = billInfo(c, k); if (!b.total && !b.L.length && k !== cur && k !== mAdd(cur, 1)) return '';
+          const state = b.paid ? `<span style="color:var(--in)">Paga${b.paid.auto ? ' (pagamento encontrado no banco)' : ''}</span>` : b.close <= hoje() ? '<span style="color:var(--am)">Fechada, a pagar</span>' : '<span style="color:var(--mu)">Aberta</span>';
+          return `<div class="fb" data-k="${k}"><span><b>Fatura de ${MESES[+k.slice(5, 7) - 1]}/${k.slice(2, 4)}</b> · ${state}</span><b>${fmt(b.total)}</b>
+            <small>Fecha ${dBR(b.close)} · vence ${dBR(b.due)} · ${b.L.length} compra(s) no app: ${fmt(b.v)}${b.bank ? ' · valor do banco: ' + fmt(b.bank.total) : ''}</small>
+            ${b.total ? (fatPaid(c, k) ? '<button class="ac" type="button" data-unpay="1">Desfazer pagamento</button>' : b.paid ? '' : '<button class="ac" type="button" data-pay="1">Marcar como paga</button>') : ''}</div>`; }).join('');
+      }
+      return `<div class="cd" data-cid="${c.id}"><div class="rw"><b>${esc(c.name)}</b><button class="sm" type="button" data-ren="1">Renomear</button></div>
+        <div class="g3"><label>Fecha no dia<input type="number" min="1" max="31" inputmode="numeric" data-k="fech" value="${c.fech || ''}" placeholder="${sugF ? 'banco: ' + sugF : 'ex.: 3'}"></label>
+        <label>Vence no dia<input type="number" min="1" max="31" inputmode="numeric" data-k="venc" value="${c.venc || ''}" placeholder="${sugV ? 'banco: ' + sugV : 'ex.: 10'}"></label>
+        <label class="full">Conta no Pluggy<select data-k="acc"><option value="">Nenhuma (só lançamentos do app)</option>${credit.map(x => `<option value="${esc(x.id)}"${x.id === acc ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label></div>
+        ${!cfg ? '<small style="display:block;margin-top:6px;color:var(--am)">Preencha o fechamento e o vencimento para separar as faturas.</small>' : ''}${bills}</div>`;
+    }).join('') || '<p class="pgempty">Nenhum cartão cadastrado.</p>'}
+    <button class="go" id="cdc-new" type="button" style="margin-top:10px">+ Novo cartão</button>`;
+}
+// sugere fechamento e vencimento do banco quando o cartão está ligado ao Pluggy e ainda não tem as datas
+function cardsAutofill() {
+  const p = P(); let ch = false;
+  (S.cards || []).forEach(c => {
+    const acc = linkedAcc(c), a = acc && p.accounts.find(x => x.id === acc);
+    if (!a || !a.credit) return;
+    if (!c.fech && a.credit.closeDate) { c.fech = +a.credit.closeDate.slice(8, 10); ch = true; }
+    if (!c.venc && a.credit.dueDate) { c.venc = +a.credit.dueDate.slice(8, 10); ch = true; }
+  });
+  if (ch) save();
+}
+$('cdc').addEventListener('change', e => {
+  const cd = e.target.closest('.cd'); if (!cd) return;
+  const c = (S.cards || []).find(x => String(x.id) === cd.dataset.cid); if (!c) return;
+  const k = e.target.dataset.k;
+  if (k === 'fech' || k === 'venc') { const v = Math.round(+e.target.value); if (v >= 1 && v <= 31) c[k] = v; else delete c[k]; }
+  else if (k === 'acc') {
+    const pw = PW(); Object.keys(pw.accMap).forEach(a => { if (String(pw.accMap[a]) === String(c.id)) delete pw.accMap[a]; });
+    if (e.target.value) pw.accMap[e.target.value] = c.id;
+    cardsAutofill();
+  } else return;
+  save(); render(); renderCards(); renderPg();
+});
+$('cdc').addEventListener('click', e => {
+  if (e.target.id === 'cdc-new') { try { openCard(null, () => { try { fillCards(); } catch (err) {} renderCards(); }); } catch (err) { say('Não consegui abrir o cadastro de cartão.', true); } return; }
+  const cd = e.target.closest('.cd'); if (!cd) return;
+  const c = (S.cards || []).find(x => String(x.id) === cd.dataset.cid); if (!c) return;
+  if (e.target.dataset.ren) { try { openCard(c.id); } catch (err) {} return; }
+  const fb = e.target.closest('.fb'); if (!fb) return;
+  const k = fb.dataset.k;
+  if (!S.fatPg || typeof S.fatPg !== 'object') S.fatPg = {};
+  S.fatPg[c.id] = S.fatPg[c.id] || {};
+  if (e.target.dataset.pay) { const b = billInfo(c, k); S.fatPg[c.id][k] = { v: Math.round(b.total * 100) / 100, d: hoje() }; say('Fatura marcada como paga.'); }
+  else if (e.target.dataset.unpay) { delete S.fatPg[c.id][k]; say('Pagamento desfeito.'); }
+  else return;
+  save(); render(); renderCards();
+});
+nav.querySelector('[data-t=rec]').addEventListener('click', () => { try { cardsAutofill(); renderCards(); } catch (e) { console.error(e); } });
+
+// ---------- Card principal: planejado para entrar, já entrou, já pago, falta pagar ----------
+function paintTape() {
+  if (!$('bal')) return;
+  const tx = S.tx.filter(t => t.date && t.date.slice(0, 7) === m);
+  const planned = S.sheet.filter(r => !r.cx && r.k === 'in').reduce((a, r) => a + ((r.v || {})[m] || 0), 0);
+  const inc = tx.filter(t => t.type === 'in' && t.cat !== 'Caixinhas').reduce((a, t) => a + t.amount, 0);
+  // compras em cartões configurados entram pela fatura (quando vence), não no dia da compra
+  const cfgCard = t => t.pay === 'Cartão' && cardCfg(t.card);
+  const outNow = tx.filter(t => t.type === 'out' && !cfgCard(t)).reduce((a, t) => a + t.amount, 0);
+  let fatPaga = 0, fatAberta = 0;
+  (S.cards || []).filter(c => cardCfg(c.id)).forEach(c => { const b = billInfo(c, m); if (b.paid) fatPaga += b.paid.v || b.total; else fatAberta += b.total; });
+  const comp = typeof openCm === 'function' && window.compReady ? openCm() : 0;
+  const pago = outNow + fatPaga, falta = comp + fatAberta;
+  const base = planned || inc, sobra = base - pago - falta;
+  $('lbl').textContent = planned ? 'Planejado para entrar no mês' : 'Entrou no mês (sem receitas planejadas em Orçamentos)';
+  $('bal').textContent = fmt(planned || inc); $('bal').className = 'big';
+  const setRow = (id, label, v, cls) => { const b = $(id); if (!b) return; b.textContent = fmt(v); b.className = cls || ''; const tn = b.previousSibling; if (tn && tn.nodeType === 3) tn.textContent = label + ' '; };
+  setRow('inc', 'Já entrou', inc); setRow('exp', 'Já pago', pago); setRow('cm', 'Falta pagar', falta);
+  let sb = $('tp-sb');
+  if (!sb) { $('cm').closest('.row').insertAdjacentHTML('beforeend', '<span id="tp-sb">Vai sobrar <b></b></span>'); sb = $('tp-sb'); }
+  sb.firstChild.textContent = sobra < 0 ? 'Vai faltar ' : 'Vai sobrar '; sb.querySelector('b').textContent = fmt(Math.abs(sobra));
+  sb.querySelector('b').style.color = sobra < 0 ? '#FF6B5E' : '#3DD68C';
+  sb.title = 'Planejado para entrar − já pago − falta pagar';
+}
+const _render4 = window.render;
+window.render = function () { const r = _render4.apply(this, arguments); try { paintTape(); } catch (e) { console.error(e); } return r; };
+paintTape();
 
 
 // ------------------------------------------------------------------ início
